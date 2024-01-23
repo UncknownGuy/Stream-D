@@ -15,6 +15,7 @@
     "child_process": "^1.0.2",
     "discord.js": "^14.14.1",
     "dotenv": "^16.3.2",
-    "node-telegram-bot-api": "^0.64.0"
+    "node-telegram-bot-api": "^0.64.0",
+    "puppeteer": "^21.7.0"
   }
 }
