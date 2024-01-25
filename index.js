@@ -2,9 +2,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const fs = require('fs');
-
 require('dotenv').config();
-
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
 const models = loadModels(); // Load models from the file on bot start
@@ -36,115 +34,189 @@ async function isModelOnline(modelURL) {
   }
 }
 
-// Function to notify the user if a model goes online
+bot.onText(/\/notify/, async (msg) => {
+  const chatId = msg.chat.id;
+  const loadedModels = loadModels();
+  const keyboardButtons = Object.keys(loadedModels).map((modelName) => ({
+    text: modelName,
+    callback_data: `notify_${modelName}`
+  }));
+
+  const keyboard = {
+    inline_keyboard: [keyboardButtons]
+  };
+
+  bot.sendMessage(chatId, 'Choose a model to receive notifications:', {
+    reply_markup: keyboard
+  });
+});
+
+bot.on('callback_query', async (query) => {
+  const chatId = query.message.chat.id;
+  const modelName = query.data.replace('notify_', '');
+
+  try {
+    await notifyUserIfOnline(modelName, chatId);
+
+    // Start listening for changes in the model's status
+    startListeningForStatusChanges(modelName, chatId);
+  } catch (error) {
+    console.error('Error handling callback:', error);
+    bot.sendMessage(chatId, 'Error handling callback. Please try again.');
+  }
+});
+function startListeningForStatusChanges(modelName, chatId) {
+  setInterval(async () => {
+    try {
+      const isOnline = await isModelOnline(models[modelName].url);
+      if (isOnline) {
+        await notifyUserIfOnline(modelName, chatId);
+      }
+    } catch (error) {
+      console.error('Error checking model status:', error);
+    }
+  }, 60000); // Check every 1 minute (adjust as needed)
+}
+
+
+
 async function notifyUserIfOnline(modelName, chatId) {
   const loadedModels = loadModels();
   const model = loadedModels[modelName];
 
   if (model) {
-    const isOnline = await isModelOnline(model.url);
-    if (isOnline) {
-      const imageURL = model.url;  // Use the same URL for displaying the image
-      const notificationMessage = `Model "${modelName}" is now online!`;
+    try {
+      const isOnline = await isModelOnline(model.url);
+      if (isOnline) {
+        const imageURL = model.url;
+        const notificationMessage = `Model "${modelName}" is now online!`;
 
-      // Send the photo along with the notification message
-      if (imageURL) {
-        bot.sendPhoto(chatId, imageURL, {
-          caption: notificationMessage
-        }).then(() => {
+        // Send the photo along with the notification message
+        if (imageURL) {
+          await bot.sendPhoto(chatId, imageURL, {
+            caption: notificationMessage
+          });
+
           // Update the model status and save to models.json
           model.status = 'online';
           saveModelsToFile(loadedModels);
-        }).catch((error) => {
-          console.error('Error sending photo:', error);
-          bot.sendMessage(chatId, 'Error sending photo');
-        });
-      } else {
-        console.error('Image not found');
-        bot.sendMessage(chatId, 'Image not found');
+        } else {
+          console.error('Image not found');
+          bot.sendMessage(chatId, 'Image not found');
+        }
       }
+    } catch (error) {
+      console.error('Error checking model status:', error);
+      throw new Error('Error checking model status. Please try again.');
     }
+  } else {
+    throw new Error(`Model "${modelName}" not found.`);
+  }
+}
+
+// Function to upload a photo to Telegram and return the file ID
+async function uploadPhotoFromURL(photoURL, msg) {
+  try {
+    const response = await axios({
+      url: photoURL,
+      method: 'GET',
+      responseType: 'arraybuffer',
+    });
+
+    const photoBuffer = Buffer.from(response.data, 'binary');
+    const photoFileID = await bot.sendPhoto(msg.chat.id, photoBuffer);
+    return { type: 'photo', media: photoFileID.photo[0].file_id };
+  } catch (error) {
+    console.error('Error uploading photo to Telegram:', error);
+    throw new Error('Error uploading photo to Telegram');
   }
 }
 
 
-bot.onText(/\/add (.+)/, (msg, match) => {
+// Command handler for /photos
+bot.onText(/\/photos (.+)/, async (msg, match) => {
   const modelName = match[1];
-  const modelURL = `https://xhamsterlive.com/${modelName}`;
-  
-  models[modelName] = {
-    url: modelURL,
-    status: 'offline'
-  };
-  saveModelsToFile(); // Save models to file
 
-  bot.sendMessage(msg.chat.id, `Model "${modelName}" added successfully!`);
+  try {
+    const photosURL = `https://xhamsterlive.com/${modelName}/photos`;
+    const response = await axios.get(photosURL);
+    const $ = cheerio.load(response.data);
+
+    // Extract photo links from the photos gallery
+    const photoLinks = [];
+    $('.photos-gallery-list-v2--5-items-layout .photos-gallery-item-v2__image').each((index, element) => {
+      const photoSrc = $(element).attr('src');
+      photoLinks.push(photoSrc);
+    });
+
+    // Log the extracted information to the console for debugging
+    console.log('Photo Links:', photoLinks);
+
+    // Send photos as individual Telegram photos
+    const photoPromises = photoLinks.map(photoLink => uploadPhotoFromURL(photoLink, msg));
+    await Promise.all(photoPromises);
+  } catch (error) {
+    console.error('Error fetching photos:', error);
+    bot.sendMessage(msg.chat.id, 'Error fetching photos');
+  }
 });
 
 bot.onText(/\/check (.+)/, async (msg, match) => {
   const modelName = match[1];
 
-  // Load models from models.json
-  const models = loadModels();
+  try {
+    const modelURL = `https://xhamsterlive.com/${modelName}`;
+    const response = await axios.get(modelURL);
+    const $ = cheerio.load(response.data);
 
-  if (models[modelName]) {
-    const model = models[modelName];
+    // Check if the model is online
+    const isOnline = !response.data.includes('<div class="availability-status offline">Offline</div>');
 
-    try {
-      const response = await axios.get(model.url);
-      const $ = cheerio.load(response.data);
-
-      // Check if the model is online
-      const isOnline = !response.data.includes('<div class="availability-status offline">Offline</div>');
-
-      // Determine the appropriate image link based on online or offline status
-      let imageURL;
-      if (isOnline) {
-        imageURL = model.url;  // Use the model.url if online
-      } else {
-        // Use the image link from the specified structure if offline
-        imageURL = $('.wrapper .main .strut.view-cam-resizer-boundary-y .big-height.poster.view-cam-resizer-player .backdrop img.image-background').attr('src');
-      }
-
-      // Extract the offline time from the specific structure
-      const offlineTime = $('.vc-status-offline-inner .offline-status-time').text().trim();
-
-      // Log the extracted image link and offline time to the console for debugging
-      console.log('Image Link:', imageURL);
-      console.log('Offline Time:', offlineTime);
-
-      // Create inline keyboard
-      const keyboard = {
-        inline_keyboard: [
-          [
-            {
-              text: `Watch ${modelName} Live`,
-              url: model.url
-            }
-          ]
-        ]
-      };
-
-      // Send the status message with the appropriate image, offline time, and inline keyboard
-      if (imageURL) {
-        const statusMessage = isOnline ? 'Model is online' : `Model is offline. ${offlineTime}`;
-        bot.sendPhoto(msg.chat.id, imageURL, {
-          caption: statusMessage,
-          reply_markup: keyboard
-        }).catch((error) => {
-          console.error('Error sending photo:', error);
-          bot.sendMessage(msg.chat.id, 'Error sending photo');
-        });
-      } else {
-        console.error('Image not found');
-        bot.sendMessage(msg.chat.id, 'Image not found');
-      }
-    } catch (error) {
-      console.error('Error checking model status:', error);
-      bot.sendMessage(msg.chat.id, 'Error checking model status');
+    // Determine the appropriate image link based on online or offline status
+    let imageURL;
+    if (isOnline) {
+      imageURL = modelURL;  // Use the modelURL if online
+    } else {
+      // Use the image link from the specified structure if offline
+      imageURL = $('.wrapper .main .strut.view-cam-resizer-boundary-y .big-height.poster.view-cam-resizer-player .backdrop img.image-background').attr('src');
     }
-  } else {
-    bot.sendMessage(msg.chat.id, `Model "${modelName}" not found. Use /add to add the model.`);
+
+    // Extract the offline time from the specific structure
+    const offlineTime = $('.vc-status-offline-inner .offline-status-time').text().trim();
+
+    // Log the extracted image link and offline time to the console for debugging
+    console.log('Image Link:', imageURL);
+    console.log('Offline Time:', offlineTime);
+
+    // Create inline keyboard
+    const keyboard = {
+      inline_keyboard: [
+        [
+          {
+            text: `Watch ${modelName} Live`,
+            url: modelURL
+          }
+        ]
+      ]
+    };
+
+    // Send the status message with the appropriate image, offline time, and inline keyboard
+    if (imageURL) {
+      const statusMessage = isOnline ? 'Model is online' : `Model is offline. ${offlineTime}`;
+      bot.sendPhoto(msg.chat.id, imageURL, {
+        caption: statusMessage,
+        reply_markup: keyboard
+      }).catch((error) => {
+        console.error('Error sending photo:', error);
+        bot.sendMessage(msg.chat.id, 'Error sending photo');
+      });
+    } else {
+      console.error('Image not found');
+      bot.sendMessage(msg.chat.id, 'Image not found');
+    }
+  } catch (error) {
+    console.error('Error checking model status:', error);
+    bot.sendMessage(msg.chat.id, 'Error checking model status');
   }
 });
 
